@@ -14,7 +14,7 @@ import seaborn as sns
 import emoji
 
 # Select the animal to pre-process and injection days
-animal_id = 952502
+animal_id = 943887
 injection_days = '3days'
 
 # Import data for that animal

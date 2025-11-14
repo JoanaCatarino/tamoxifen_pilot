@@ -12,12 +12,17 @@ import seaborn as sns
 from collections import defaultdict
 from matplotlib.lines import Line2D
 
+# -------- Stats ------------
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
 # ----------------- CONFIG -----------------
 # Map each condition to the list of animal IDs in that condition
 animals_by_condition = {
     "1day": [916931, 943882, 943883, 952505],
     "2days": [943886, 943890, 943891], 
-    "3days": [916934, 943884],
+    "3days": [916934, 943884, 943887],
     "5days": [943885, 943889, 943888]
 }
 
@@ -30,6 +35,41 @@ OUT = r"L:/dmclab/Joana/Tamoxifen_pilot/Analysis/plots"
 # PFC acronyms
 PFC_acronyms = ["FRP", "PL", "ILA", "ACAd", "ACAv", 
                 "ORBm", "ORBl", "ORBvl", "Mos", "AId", "AIv"]
+
+# Choose a fixed color for each condition
+colors_by_condition = {
+    "1day": "#B5D9CC",
+    "2days":  "#5B9E9A",
+    "3days": "#9490B4",
+    "5days":  "#815D9F"
+}
+
+default_color = "#5c5c5c"
+
+# -------- SIGNIFICANCE ANNOTATION TUNING --------
+# Global figure headroom (space above tallest element) to fit brackets
+HEADROOM_A = 1.18   # Plot A (totals)
+HEADROOM_B = 1.28   # Plot B (layers)
+
+# Vertical spacing per stacked bracket (fraction of y-range)
+BRACKET_STEP_A = 0.045   # Plot A
+BRACKET_STEP_B = 0.055   # Plot B
+
+# Height of the little vertical tick at ends of bracket (fraction of y-range)
+BRACKET_TICK_A = 0.22    # as a fraction of BRACKET_STEP_A
+BRACKET_TICK_B = 0.22
+
+# Gap between bracket and text (fraction of y-range)
+TEXT_GAP_A = 0.006
+TEXT_GAP_B = 0.008
+
+# Line width & text style
+BRACKET_LW = 1.6
+STAR_FONTSIZE_A = 12
+STAR_FONTSIZE_B = 11
+
+# Max number of pairwise brackets to draw per layer (keeps figure readable)
+MAX_SIG_PER_LAYER = 6
 
 # ------------------------------------------
 
@@ -45,6 +85,27 @@ def clean_layer_name(layer_value):
     # Make layer labels consistent across animals
     s = str(layer_value)
     return s.replace("layer ", "").strip()
+
+def sem(x):
+    x = np.asarray(x, dtype=float)
+    n = np.isfinite(x).sum()
+    if n <= 1: return np.nan
+    return np.nanstd(x, ddof=1) / np.sqrt(n)
+
+def p_to_stars(p):
+    return "***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else "ns"))
+
+def draw_sig_bracket(ax, x1, x2, y, step_height, text, gap, lw, fontsize):
+    """Draw one bracket between x1 and x2 at base y, with given step height."""
+    tick = step_height *  BRACKET_TICK_A if fontsize==STAR_FONTSIZE_A else step_height * BRACKET_TICK_B
+    ax.plot([x1, x1, x2, x2],
+            [y,  y+tick, y+tick, y],
+            lw=lw, c="black", clip_on=False)
+    ax.text((x1+x2)/2, y+tick+gap, text, ha='center', va='bottom',
+            fontsize=fontsize, color="black", clip_on=False)
+
+
+# --------------- Load and Prep data
 
 # Collect per-animal totals and layers
 totals_records = []   # rows: animal_id, condition, metric, value
@@ -110,14 +171,6 @@ if len(layer_df):
     layer_df = complete.merge(layer_df, on=["animal_id", "condition", "layer"], how="left")
     layer_df["count"] = layer_df["count"].fillna(0).astype(int)
 
-# -------- Aggregate: mean ± SEM --------
-def sem(x):
-    x = np.asarray(x, dtype=float)
-    n = np.isfinite(x).sum()
-    if n <= 1:
-        return np.nan
-    return np.nanstd(x, ddof=1) / np.sqrt(n)
-
 # Totals summary per condition and metric
 totals_summary = (
     totals_df
@@ -139,6 +192,40 @@ layers_summary = layers_summary[~layers_summary["layer"].astype(str).str.lower()
 
 print("Totals summary:\n", totals_summary)
 print("\nLayers summary (first rows):\n", layers_summary.head())
+
+# ------------------- STATS -------------------
+
+# ANOVA + Tukey for totals / PFC
+tukey_sig_pairs_totals = {}
+for metric in ["Total cells","PFC cells"]:
+    sub = totals_df[totals_df["metric"] == metric]
+    model = ols('value ~ C(condition)', data=sub).fit()
+    print(f"\n=== ANOVA: {metric} ===\n", sm.stats.anova_lm(model, typ=2))
+    tk = pairwise_tukeyhsd(sub["value"], sub["condition"], alpha=0.05)
+    print(f"\n--- Tukey HSD: {metric} ---\n", tk.summary())
+    res = pd.DataFrame(tk._results_table.data[1:], columns=tk._results_table.data[0])
+    tukey_sig_pairs_totals[metric] = [
+        (str(r["group1"]), str(r["group2"]), float(r["p-adj"]), p_to_stars(float(r["p-adj"])))
+        for _, r in res.iterrows() if bool(r["reject"])
+    ]
+
+# ANOVA + Tukey for layers
+from collections import defaultdict as dd
+tukey_sig_pairs_layers = dd(list)
+for lyr in sorted(layer_df["layer"].unique(), key=lambda x:(str(x).isdigit(), str(x))):
+    sub = layer_df[layer_df["layer"] == lyr]
+    if sub["count"].sum() == 0: continue
+    model = ols('count ~ C(condition)', data=sub).fit()
+    print(f"\n=== ANOVA: Layer {lyr} ===\n", sm.stats.anova_lm(model, typ=2))
+    tk = pairwise_tukeyhsd(sub["count"], sub["condition"], alpha=0.05)
+    print(f"\n--- Tukey HSD: Layer {lyr} ---\n", tk.summary())
+    res = pd.DataFrame(tk._results_table.data[1:], columns=tk._results_table.data[0])
+    for _, r in res.iterrows():
+        if bool(r["reject"]):
+            tukey_sig_pairs_layers[lyr].append(
+                (str(r["group1"]), str(r["group2"]), float(r["p-adj"]), p_to_stars(float(r["p-adj"])))
+            )
+
 
 # ------------------ Plot A: Total vs PFC cells (mean ± SEM by condition) ------------------
 sns.set_context("talk")
@@ -193,24 +280,36 @@ handles.append(Line2D([0],[0], marker='o', linestyle='', color="#1f1f1f",
 labels.append("Animals (dots)")
 ax.legend(handles, labels)
 ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.18), ncol=2, frameon=False)
+
+# Annotate (stats) 
+ymax = max(ax.get_ylim()[1], np.nanmax(np.r_[means["Total cells"], means["PFC cells"]]))
+ax.set_ylim(top=ymax * HEADROOM_A)
+yrange = ax.get_ylim()[1] - ax.get_ylim()[0]
+step   = BRACKET_STEP_A * yrange
+gap    = TEXT_GAP_A * yrange
+
+offsets = {"Total cells": -width/2, "PFC cells": +width/2}
+for metric, fontsize in [("Total cells", STAR_FONTSIZE_A), ("PFC cells", STAR_FONTSIZE_A)]:
+    pairs = tukey_sig_pairs_totals.get(metric, [])
+    stacks = defaultdict(int)
+    for g1, g2, p, stars in pairs:
+        i1, i2 = conditions.index(g1), conditions.index(g2)
+        x1, x2 = i1 + offsets[metric], i2 + offsets[metric]
+        base_y = max(means[metric][i1], means[metric][i2])
+        k = max(stacks[i1], stacks[i2])
+        y = base_y + step*(k + 0.25)          # shift 0.25 = small lift above bar top
+        draw_sig_bracket(ax, x1, x2, y, step, stars, gap, BRACKET_LW, fontsize)
+        stacks[i1] = stacks[i2] = k + 1
+
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
 plt.tight_layout()
 
 
-plt.savefig(f"{OUT}/Tamoxifen_Total_vs_PFC_by_condition.png", dpi=500)
-plt.savefig(f"{OUT}/Tamoxifen_Total_vs_PFC_by_condition.svg", dpi=500)
+#plt.savefig(f"{OUT}/Tamoxifen_Total_vs_PFC_by_condition.png", dpi=500)
+#plt.savefig(f"{OUT}/Tamoxifen_Total_vs_PFC_by_condition.svg", dpi=500)
 
 # ------------------ Plot B: PFC split by layer (mean ± SEM by condition) ------------------
-# ---- choose a fixed color for each condition ----
-colors_by_condition = {
-    "1day": "#B5D9CC",
-    "2days":  "#5B9E9A",
-    "3days": "#9490B4",
-    "5days":  "#815D9F"
-}
-
-default_color = "#5c5c5c"
 
 if len(layers_summary):
     
@@ -278,9 +377,31 @@ if len(layers_summary):
     ax.set_title("PFC cells split by layer")
     ax.legend(title="Condition")
     ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.18), ncol=5, frameon=False)
+    
+    # Annotate (stats)
+    ymax = ax.get_ylim()[1]
+    ax.set_ylim(top=ymax * HEADROOM_B)
+    yrange = ax.get_ylim()[1] - ax.get_ylim()[0]
+    step   = BRACKET_STEP_B * yrange
+    gap    = TEXT_GAP_B * yrange
+
+    from collections import defaultdict as dd2
+    for k, L in enumerate(layers_order):
+        pairs = tukey_sig_pairs_layers.get(L, [])[:MAX_SIG_PER_LAYER]
+        stacks = dd2(int)
+        for g1, g2, p, stars in pairs:
+            i1, i2 = conditions.index(g1), conditions.index(g2)
+            x1 = k + i1*width - (len(conditions)-1)*width/2
+            x2 = k + i2*width - (len(conditions)-1)*width/2
+            base_y = max(bar_tops[(L,g1)], bar_tops[(L,g2)])
+            h = max(stacks[i1], stacks[i2])
+            y = base_y + step*(h + 0.25)
+            draw_sig_bracket(ax, x1, x2, y, step, stars, gap, BRACKET_LW, STAR_FONTSIZE_B)
+            stacks[i1] = stacks[i2] = h + 1
+    
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     plt.tight_layout()
     
-    plt.savefig(f"{OUT}/Tamoxifen_PFC_layers_by_condition.png", dpi=500)
-    plt.savefig(f"{OUT}/Tamoxifen_PFC_layers_by_condition.svg", dpi=500)
+    #plt.savefig(f"{OUT}/Tamoxifen_PFC_layers_by_condition.png", dpi=500)
+    #plt.savefig(f"{OUT}/Tamoxifen_PFC_layers_by_condition.svg", dpi=500)
